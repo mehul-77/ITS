@@ -2,6 +2,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import numpy as np
+import cv2
 
 from preprocessing import preprocess
 from road_detection import detect_roads
@@ -18,6 +19,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "version": "1.0", "message": "ITS Road Network API"}
 
 
 @app.post("/process-image")
