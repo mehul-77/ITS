@@ -1,25 +1,39 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-import uvicorn
-import numpy as np
-import cv2
+"""
+FastAPI Backend for Road Network Extraction
+Combines OpenStreetMap analysis + Classical CV road detection
+"""
 
+import os
+import sys
 import json
 import math
+import base64
 import tempfile
-import urllib.error
+import shutil
 import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from preprocessing import preprocess
-from road_detection import detect_roads
-from feature_extraction import extract_features
-from its_metrics import compute_all_metrics
-from utils import pil_from_bytes, pil_to_cv2, image_to_base64
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+import uvicorn
+import numpy as np
+import cv2
 
-app = FastAPI(title="India ITS Feature Extraction Backend")
+# ── Import local CV modules ──────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__) + "/../src")
+from road_extractor import load_image, preprocess, detect_roads, compute_metrics
+from geojson_exporter import export_roads_to_geojson
+from report_generator import generate_report
+from change_detector import align_images, detect_changes, change_metrics, build_change_overlay
+
+
+app = FastAPI(
+    title="Road Network Extraction API",
+    description="ITS Project — Road network analysis using OSM + satellite imagery CV",
+    version="2.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,11 +46,44 @@ app.add_middleware(
 TEMP_DIR = Path(tempfile.gettempdir()) / "road_extraction"
 TEMP_DIR.mkdir(exist_ok=True)
 
-OVERPASS_URLS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
-]
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def save_upload(file: UploadFile) -> str:
+    path = TEMP_DIR / file.filename
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return str(path)
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Distance in km between two lat/lon points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def bbox_from_center(lat, lon, radius_m):
+    """Approximate bounding box from center + radius in meters."""
+    d_lat = radius_m / 111320
+    d_lon = radius_m / (111320 * math.cos(math.radians(lat)))
+    return {
+        "lat_min": lat - d_lat,
+        "lat_max": lat + d_lat,
+        "lon_min": lon - d_lon,
+        "lon_max": lon + d_lon,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OSM / OVERPASS HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
 ROAD_HIERARCHY = {
     "motorway":       {"level": 1, "color": "#e74c3c", "label": "Motorway"},
@@ -60,27 +107,9 @@ ROAD_HIERARCHY = {
     "track":          {"level": 9, "color": "#6c5ce7", "label": "Track"},
 }
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Distance in km between two lat/lon points."""
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-def bbox_from_center(lat, lon, radius_m):
-    """Approximate bounding box from center + radius in meters."""
-    d_lat = radius_m / 111320
-    d_lon = radius_m / (111320 * math.cos(math.radians(lat)))
-    return {
-        "lat_min": lat - d_lat,
-        "lat_max": lat + d_lat,
-        "lon_min": lon - d_lon,
-        "lon_max": lon + d_lon,
-    }
-
-def fetch_osm_roads(bbox, max_retries: int = 2):
-    """Fetch roads from Overpass API with retry + endpoint fallback for reliability."""
+def fetch_osm_roads(bbox, max_retries: int = 3):
+    """Fetch roads from Overpass API with retry + backoff for reliability."""
     import time
     import urllib.parse
     query = f"""
@@ -91,29 +120,24 @@ def fetch_osm_roads(bbox, max_retries: int = 2):
     out geom;
     """
     data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    req = urllib.request.Request(
+        OVERPASS_URL,
+        data=data,
+        headers={"User-Agent": "ITS-RoadExtraction/2.0"},
+    )
 
     last_err = None
-    for endpoint in OVERPASS_URLS:
-        req = urllib.request.Request(
-            endpoint,
-            data=data,
-            headers={"User-Agent": "ITS-RoadExtraction/2.0"},
-        )
-        for attempt in range(max_retries):
-            try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                last_err = e
-                if e.code not in {429, 500, 502, 503, 504}:
-                    break
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-            except Exception as e:
-                last_err = e
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                time.sleep(wait)
     raise last_err
+
 
 def road_length_km(geometry):
     """Calculate road length from a list of {lat, lon} nodes."""
@@ -125,21 +149,25 @@ def road_length_km(geometry):
         )
     return round(total, 4)
 
+
 def build_analysis(osm_data, bbox, lat, lon, radius):
     """Process raw Overpass data into the structure the frontend expects."""
     elements = [e for e in osm_data.get("elements", []) if e["type"] == "way" and "geometry" in e]
 
+    # ── Build GeoJSON features ────────────────────────────────────────────
     features = []
-    type_totals = {}
-    all_nodes = {}
+    type_totals = {}  # highway_type -> total_length_km
+    all_nodes = {}    # node coordinate -> set of way ids (for intersection detection)
 
     for way in elements:
         highway = way.get("tags", {}).get("highway", "unclassified")
         info = ROAD_HIERARCHY.get(highway, {"level": 7, "color": "#7f8c8d", "label": highway.replace("_", " ").title()})
         geom = way.get("geometry", [])
         length = road_length_km(geom)
+
         coords = [[pt["lon"], pt["lat"]] for pt in geom]
 
+        # Track nodes for intersection detection
         for pt in geom:
             key = (round(pt["lat"], 6), round(pt["lon"], 6))
             if key not in all_nodes:
@@ -160,14 +188,20 @@ def build_analysis(osm_data, bbox, lat, lon, radius):
                 "length_km": length,
             },
         })
+
         type_totals[highway] = type_totals.get(highway, 0) + length
 
     geojson = {"type": "FeatureCollection", "features": features}
 
+    # ── Intersections & dead ends ─────────────────────────────────────────
     intersections = []
     dead_ends_list = []
+    for (nlat, nlon), way_ids in all_nodes.items():
+        if len(way_ids) >= 3:
+            intersections.append([nlat, nlon])
+        # Dead ends: nodes that appear exactly once across all ways AND are endpoints
+    # Simpler: count node occurrences; if a node appears only in one way and is an endpoint
     endpoint_counts = {}
-    
     for way in elements:
         geom = way.get("geometry", [])
         if len(geom) < 2:
@@ -177,12 +211,11 @@ def build_analysis(osm_data, bbox, lat, lon, radius):
             endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
 
     for (nlat, nlon), way_ids in all_nodes.items():
-        if len(way_ids) >= 3:
-            intersections.append([nlat, nlon])
         key = (nlat, nlon)
         if len(way_ids) == 1 and endpoint_counts.get(key, 0) == 1:
             dead_ends_list.append([nlat, nlon])
 
+    # ── Type distribution ─────────────────────────────────────────────────
     total_length = sum(type_totals.values())
     type_distribution = []
     for highway, length in sorted(type_totals.items(), key=lambda x: -x[1]):
@@ -196,12 +229,14 @@ def build_analysis(osm_data, bbox, lat, lon, radius):
             "length_km": round(length, 2),
         })
 
+    # ── Summary metrics ───────────────────────────────────────────────────
     area_km2 = math.pi * (radius / 1000) ** 2
     int_count = len(intersections)
     de_count = len(dead_ends_list)
     density = round(total_length / area_km2, 1) if area_km2 > 0 else 0
     connectivity = round(int_count / (int_count + de_count) * 100, 1) if (int_count + de_count) > 0 else 0
 
+    # ITS readiness — 4 tiers
     if density > 15 and connectivity >= 65:
         its = {"label": "High", "desc": f"Dense, well-connected road network ({density} km/km², {connectivity}% connectivity). Excellent for full ITS deployment."}
     elif density > 8 and connectivity >= 50:
@@ -223,12 +258,14 @@ def build_analysis(osm_data, bbox, lat, lon, radius):
         "its_readiness": its,
     }
 
+    # ── Zone grid (for heatmap layer) ─────────────────────────────────────
     grid_n = 6
     lat_step = (bbox["lat_max"] - bbox["lat_min"]) / grid_n
     lon_step = (bbox["lon_max"] - bbox["lon_min"]) / grid_n
-    cells = []
-    max_cell_length = 0.001
+    zone_grid = []
+    max_cell_length = 0.001  # avoid div-by-zero
 
+    cells = []
     for row in range(grid_n):
         for col in range(grid_n):
             cell_lat_min = bbox["lat_min"] + row * lat_step
@@ -270,155 +307,22 @@ def build_analysis(osm_data, bbox, lat, lon, radius):
         "zone_grid": zone_grid,
     }
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "version": "1.0",
-        "message": "ITS Road Network API",
-    }
-
-# ==============================================================================
-# EXISTING ENDPOINTS (From legacy ITS-1)
-# ==============================================================================
-
-@app.post("/process-image")
-async def process_image(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        pil = pil_from_bytes(contents)
-        img_bgr = pil_to_cv2(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image file: {e}")
-
-    resized_bgr, enhanced_gray = preprocess(img_bgr, max_dim=768)
-    road_mask, detector_meta = detect_roads(resized_bgr)
-    skeleton, features = extract_features(road_mask)
-    metrics = compute_all_metrics(road_mask, skeleton, features)
-    analysis_summary = summarize_satellite_analysis(metrics)
-
-    mask_color = np.zeros_like(resized_bgr)
-    mask_color[:, :, 1] = (road_mask > 0).astype(np.uint8) * 160
-    mask_color[:, :, 2] = (road_mask > 0).astype(np.uint8) * 255
-    overlay = cv2_add_weighted_safe(resized_bgr, mask_color, alpha=0.8, beta=0.35)
-
-    vis = overlay.copy()
-    for (x, y) in features["intersections"][:200]:
-        cv2.circle(vis, (x, y), radius=6, color=(0, 255, 255), thickness=1)
-    for (x, y) in features["endpoints"][:200]:
-        cv2.circle(vis, (x, y), radius=4, color=(255, 140, 0), thickness=1)
-
-    skeleton_bgr = np.zeros_like(resized_bgr)
-    skeleton_bgr[:, :, 0] = (skeleton > 0).astype(np.uint8) * 255
-    skeleton_bgr[:, :, 1] = (skeleton > 0).astype(np.uint8) * 220
-    for (x, y) in features["intersections"][:200]:
-        cv2.circle(skeleton_bgr, (x, y), radius=5, color=(0, 255, 255), thickness=1)
-
-    response = {
-        "processed_image": image_to_base64(vis, fmt="png"),
-        "road_mask_image": image_to_base64(road_mask, fmt="png"),
-        "skeleton_image": image_to_base64(skeleton_bgr, fmt="png"),
-        "enhanced_image": image_to_base64(enhanced_gray, fmt="png"),
-        "road_density": metrics["road_density"],
-        "road_density_percent": metrics["road_density_percent"],
-        "road_length": metrics["road_length"],
-        "intersection_count": metrics["intersection_count"],
-        "endpoint_count": metrics["endpoint_count"],
-        "average_width_px": metrics["average_width_px"],
-        "connectivity_score": metrics["connectivity_score"],
-        "feature_summary": features,
-        "pipeline": {
-            "detector": detector_meta["method"],
-            "steps": [
-                "Contrast enhancement and noise suppression",
-                "Fast classical road extraction with structural and line support",
-                "Skeletonization and topological feature extraction",
-                "ITS-oriented metric computation for transport planning",
-            ],
-        },
-        "analysis_summary": analysis_summary,
-        "use_cases": [
-            "Road inventory support for Indian smart-city corridors",
-            "Intersection hotspot review for signal optimization studies",
-            "Preliminary transport-network screening from satellite scenes",
-        ],
-    }
-    return response
-
-def cv2_add_weighted_safe(img1, img2, alpha=0.7, beta=0.3):
-    import cv2
-    if img1.shape != img2.shape:
-        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]), interpolation=cv2.INTER_NEAREST)
-    img1_u8 = img1.astype("uint8")
-    img2_u8 = img2.astype("uint8")
-    return cv2.addWeighted(img1_u8, alpha, img2_u8, beta, 0)
+    return {"status": "ok", "message": "Road Network Extraction API v2 is running"}
 
 
-def summarize_satellite_analysis(metrics: dict) -> dict:
-    density = metrics["road_density_percent"]
-    width = metrics["average_width_px"]
-    intersections = metrics["intersection_count"]
-    connectivity = metrics["connectivity_score"]
-
-    if density < 6:
-        coverage = "Low coverage"
-    elif density < 16:
-        coverage = "Moderate coverage"
-    else:
-        coverage = "Dense coverage"
-
-    if width >= 10:
-        road_profile = "Wide corridor or arterial-road dominant scene"
-    elif width >= 5:
-        road_profile = "Mixed urban street scene"
-    else:
-        road_profile = "Narrow lane or fragmented extraction"
-
-    if intersections >= 25:
-        pattern = "Grid-like or junction-heavy local network"
-    elif intersections >= 8:
-        pattern = "Moderately connected roadway pattern"
-    else:
-        pattern = "Few clear junctions detected"
-
-    if density > 30 or connectivity > 0.92:
-        confidence = "Low"
-        caution = "Likely over-detection remains; validate visually before using these counts."
-    elif density < 1 and intersections == 0:
-        confidence = "Low"
-        caution = "Road evidence is too weak; likely under-detection or unsuitable imagery."
-    else:
-        confidence = "Medium"
-        caution = "Useful for screening and presentation, but still not a survey-grade road inventory."
-
-    return {
-        "coverage_class": coverage,
-        "road_profile": road_profile,
-        "network_pattern": pattern,
-        "extraction_confidence": confidence,
-        "caution": caution,
-        "planning_note": "Use this output for rapid ITS screening, corridor review, and feature comparison with map data.",
-    }
-
-def get_intersection_coords(skeleton_uint8):
-    """
-    Return list of (x, y) coords of intersection pixels to plot.
-    Uses same neighbor counting method as feature_extraction.
-    """
-    import numpy as np
-    import cv2
-    skel = (skeleton_uint8 > 0).astype(np.uint8)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    neighbor_sum = cv2.filter2D(skel, -1, kernel) - skel
-    intersections = np.logical_and(skel == 1, neighbor_sum >= 3)
-    ys, xs = np.where(intersections)
-    coords = list(zip(xs.tolist(), ys.tolist()))
-    return coords
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 
-# ==============================================================================
-# NEW OSM ENDPOINTS (Added during dashboard integration)
-# ==============================================================================
+# ── CITY ANALYSIS (OSM) ─────────────────────────────────────────────────────
 
 @app.get("/analyze")
 async def analyze(
@@ -432,15 +336,75 @@ async def analyze(
         osm_data = fetch_osm_roads(bbox)
         result = build_analysis(osm_data, bbox, lat, lon, radius)
         return JSONResponse(result)
-    except urllib.error.HTTPError as e:
-        if e.code in {429, 500, 502, 503, 504}:
-            raise HTTPException(
-                503,
-                "OpenStreetMap road service is temporarily busy or timed out. Try again, or reduce the radius to 1000-1500 meters.",
-            )
-        raise HTTPException(500, f"OSM analysis failed: HTTP {e.code}")
     except Exception as e:
         raise HTTPException(500, f"OSM analysis failed: {str(e)}")
+
+
+# ── CV SATELLITE IMAGE DETECTION ────────────────────────────────────────────
+
+@app.post("/cv/detect")
+async def cv_detect(
+    file: UploadFile = File(...),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+):
+    """Upload a satellite image → CV road extraction + optional OSM comparison."""
+    if not file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        raise HTTPException(400, "Only JPG/PNG images are supported")
+
+    img_path = save_upload(file)
+
+    try:
+        img = load_image(img_path)
+        pre = preprocess(img)
+        res = detect_roads(pre, original_rgb=img)
+        metrics = compute_metrics(img, res)
+
+        def to_b64(arr: np.ndarray) -> str:
+            _, buf = cv2.imencode(".png", arr)
+            return base64.b64encode(buf).decode()
+
+        # Original image as base64
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        # Overlay: skeleton on original
+        overlay = img.copy()
+        overlay[res["skeleton"] > 0] = [255, 80, 80]
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+
+        cv_result = {
+            "metrics": {
+                "road_area_percent": metrics["road_area_percent"],
+                "num_segments": metrics["num_road_segments"],
+                "road_length_pixels": metrics["road_length_pixels"],
+                "road_density": round(metrics["road_density_per_px"] * 100, 4),
+            },
+            "images": {
+                "original": to_b64(img_bgr),
+                "mask": to_b64(res["binary_mask"]),
+                "skeleton": to_b64(res["skeleton"]),
+                "overlay": to_b64(overlay_bgr),
+            },
+        }
+
+        # Optional OSM comparison
+        osm_result = None
+        if lat is not None and lon is not None:
+            try:
+                bbox = bbox_from_center(lat, lon, 800)
+                osm_data = fetch_osm_roads(bbox)
+                analysis = build_analysis(osm_data, bbox, lat, lon, 800)
+                osm_result = {"summary": analysis["metrics"]["summary"]}
+            except Exception:
+                osm_result = None
+
+        return JSONResponse({"cv": cv_result, "osm": osm_result})
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── GEOJSON EXPORT ───────────────────────────────────────────────────────────
 
 @app.get("/geojson")
 async def export_geojson_endpoint(
@@ -466,6 +430,9 @@ async def export_geojson_endpoint(
         )
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ── PDF REPORT ───────────────────────────────────────────────────────────────
 
 @app.get("/report")
 async def generate_report_endpoint(
@@ -584,6 +551,74 @@ async def generate_report_endpoint(
         )
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ── CHANGE DETECTION (keep from original) ────────────────────────────────────
+
+@app.post("/change")
+async def change_detection(
+    before: UploadFile = File(...),
+    after: UploadFile = File(...),
+):
+    """Upload before + after images → get change metrics + colour overlay."""
+    before_path = save_upload(before)
+    after_path = save_upload(after)
+
+    try:
+        img_b = load_image(before_path)
+        img_a = load_image(after_path)
+        img_a = align_images(img_b, img_a)
+
+        res_b = detect_roads(preprocess(img_b), original_rgb=img_b)
+        res_a = detect_roads(preprocess(img_a), original_rgb=img_a)
+
+        changes = detect_changes(res_b["binary_mask"], res_a["binary_mask"])
+        metrics = change_metrics(changes, img_b.shape[0] * img_b.shape[1])
+
+        overlay = build_change_overlay(img_b, changes)
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        _, buf = cv2.imencode(".png", overlay_bgr)
+        overlay_b64 = base64.b64encode(buf).decode()
+
+        return JSONResponse({"metrics": metrics, "overlay": overlay_b64})
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── LEGACY CV ENDPOINTS (kept for backwards compatibility) ───────────────────
+
+@app.post("/detect")
+async def detect(file: UploadFile = File(...)):
+    """Legacy: Upload a satellite image → get road metrics + base64 result images."""
+    if not file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        raise HTTPException(400, "Only JPG/PNG images are supported")
+
+    img_path = save_upload(file)
+    try:
+        img = load_image(img_path)
+        pre = preprocess(img)
+        res = detect_roads(pre, original_rgb=img)
+        metrics = compute_metrics(img, res)
+
+        def to_b64(arr: np.ndarray) -> str:
+            _, buf = cv2.imencode(".png", arr)
+            return base64.b64encode(buf).decode()
+
+        overlay = img.copy()
+        overlay[res["skeleton"] > 0] = [255, 80, 80]
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+
+        return JSONResponse({
+            "metrics": metrics,
+            "images": {
+                "road_mask": to_b64(res["binary_mask"]),
+                "skeleton": to_b64(res["skeleton"]),
+                "overlay": to_b64(overlay_bgr),
+            },
+        })
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

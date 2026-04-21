@@ -35,7 +35,7 @@ def create_test_satellite_image():
             )
     
     # Save the image
-    img.save('c:/Users/DELL/Desktop/its proj/ITS/sample_images/test_satellite.jpg')
+    img.save('sample_images/test_satellite.jpg')
     print("✓ Test satellite image created: sample_images/test_satellite.jpg")
     return img
 
@@ -43,7 +43,7 @@ def create_test_satellite_image():
 def test_api():
     """Test the backend API"""
     api_url = "http://localhost:8000/process-image"
-    image_path = "c:/Users/DELL/Desktop/its proj/ITS/sample_images/test_satellite.jpg"
+    image_path = "sample_images/test_satellite.jpg"
     
     # Create test image
     create_test_satellite_image()
@@ -79,7 +79,7 @@ def test_api():
                 # Decode and save
                 import base64
                 img_data = base64.b64decode(processed_img_base64.split(',')[1])
-                with open('c:/Users/DELL/Desktop/its proj/ITS/sample_images/processed_result.png', 'wb') as f:
+                with open('sample_images/processed_result.png', 'wb') as f:
                     f.write(img_data)
                 print("✓ Saved processed image to: sample_images/processed_result.png")
             

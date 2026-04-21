@@ -1,16 +1,15 @@
-import Image from 'next/image';
+import "leaflet/dist/leaflet.css";
+import "./globals.css";
+
+export const metadata = {
+  title: "India ITS Feature Extraction Studio",
+  description: "India-focused intelligent transportation system dashboard for road-network analysis and satellite feature extraction.",
+};
 
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>ITS - Road Network Extraction</title>
-      </head>
-      <body>
-        {children}
-      </body>
+      <body>{children}</body>
     </html>
   );
 }
