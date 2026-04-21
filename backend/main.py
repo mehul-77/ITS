@@ -295,7 +295,7 @@ async def process_image(file: UploadFile = File(...)):
     road_mask, detector_meta = detect_roads(resized_bgr)
     skeleton, features = extract_features(road_mask)
     metrics = compute_all_metrics(road_mask, skeleton, features)
-    analysis_summary = summarize_satellite_analysis(metrics)
+    analysis_summary = summarize_satellite_analysis(metrics, detector_meta)
 
     mask_color = np.zeros_like(resized_bgr)
     mask_color[:, :, 1] = (road_mask > 0).astype(np.uint8) * 160
@@ -354,11 +354,14 @@ def cv2_add_weighted_safe(img1, img2, alpha=0.7, beta=0.3):
     return cv2.addWeighted(img1_u8, alpha, img2_u8, beta, 0)
 
 
-def summarize_satellite_analysis(metrics: dict) -> dict:
+def summarize_satellite_analysis(metrics: dict, detector_meta: dict | None = None) -> dict:
+    detector_meta = detector_meta or {}
     density = metrics["road_density_percent"]
     width = metrics["average_width_px"]
     intersections = metrics["intersection_count"]
     connectivity = metrics["connectivity_score"]
+    components = int(detector_meta.get("components_kept", 0) or 0)
+    lines = int(detector_meta.get("corridor_lines", 0) or detector_meta.get("hough_lines", 0) or 0)
 
     if density < 6:
         coverage = "Low coverage"
@@ -381,12 +384,33 @@ def summarize_satellite_analysis(metrics: dict) -> dict:
     else:
         pattern = "Few clear junctions detected"
 
-    if density > 30 or connectivity > 0.92:
+    quality_score = 100
+    if density < 3:
+        quality_score -= 45
+    elif density < 8:
+        quality_score -= 25
+    if components > 35:
+        quality_score -= 25
+    if lines < 20:
+        quality_score -= 20
+    if intersections == 0 and density > 6:
+        quality_score -= 20
+    if connectivity >= 0.98 and intersections > 12:
+        quality_score -= 10
+    quality_score = max(0, min(100, quality_score))
+
+    if density > 35:
         confidence = "Low"
         caution = "Likely over-detection remains; validate visually before using these counts."
     elif density < 1 and intersections == 0:
         confidence = "Low"
         caution = "Road evidence is too weak; likely under-detection or unsuitable imagery."
+    elif quality_score < 55:
+        confidence = "Low"
+        caution = "Roads were not picked up clearly; use this only as a rough visual screening result."
+    elif 8 <= density <= 26 and width >= 6:
+        confidence = "Medium"
+        caution = "Extraction is suitable for screening and presentation; verify fine road boundaries manually."
     else:
         confidence = "Medium"
         caution = "Useful for screening and presentation, but still not a survey-grade road inventory."
@@ -396,6 +420,7 @@ def summarize_satellite_analysis(metrics: dict) -> dict:
         "road_profile": road_profile,
         "network_pattern": pattern,
         "extraction_confidence": confidence,
+        "quality_score": quality_score,
         "caution": caution,
         "planning_note": "Use this output for rapid ITS screening, corridor review, and feature comparison with map data.",
     }
@@ -479,6 +504,15 @@ async def generate_report_endpoint(
         osm_data = fetch_osm_roads(bbox)
         analysis = build_analysis(osm_data, bbox, lat, lon, radius)
         s = analysis["metrics"]["summary"]
+        readiness_score = round(
+            min(
+                100,
+                (min(s["road_density_km_km2"], 20) / 20 * 45)
+                + (s["connectivity_index"] / 100 * 35)
+                + (min(s["intersection_count"], 80) / 80 * 20),
+            ),
+            1,
+        )
 
         output_path = str(TEMP_DIR / "its_report.pdf")
 
@@ -516,7 +550,30 @@ async def generate_report_endpoint(
         story.append(Paragraph(f"ITS Analysis  ·  {now}  ·  ({lat}, {lon}) radius {radius}m", styles["subtitle"]))
         story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=16))
 
-        story.append(Paragraph("1. Network Summary", styles["section"]))
+        story.append(Paragraph("1. Location and Study Area", styles["section"]))
+        location_table = [
+            ["Field", "Value"],
+            ["Latitude", f"{lat:.6f}"],
+            ["Longitude", f"{lon:.6f}"],
+            ["Radius", f"{radius} m"],
+            ["Bounding Box", f"{bbox['lat_min']:.6f}, {bbox['lon_min']:.6f} to {bbox['lat_max']:.6f}, {bbox['lon_max']:.6f}"],
+        ]
+        lt = Table(location_table, colWidths=[6*cm, 10*cm])
+        lt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BLUE]),
+            ("BOX", (0, 0), (-1, -1), 1, BORDER),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(lt)
+        story.append(Spacer(1, 0.35*cm))
+
+        story.append(Paragraph("2. Network Summary", styles["section"]))
         story.append(Paragraph(
             f"Analysis of the road network within {radius}m of ({lat:.4f}, {lon:.4f}) "
             f"using OpenStreetMap data.", styles["body"]
@@ -533,6 +590,7 @@ async def generate_report_endpoint(
             ["Dead Ends", str(s["dead_end_count"])],
             ["Connectivity Index", f"{s['connectivity_index']}%"],
             ["ITS Readiness", s["its_readiness"]["label"]],
+            ["Readiness Score", f"{readiness_score} / 100"],
         ]
         t = Table(table_data, colWidths=[8*cm, 8*cm])
         t.setStyle(TableStyle([
@@ -549,7 +607,7 @@ async def generate_report_endpoint(
         story.append(t)
         story.append(Spacer(1, 0.5*cm))
 
-        story.append(Paragraph("2. Road Type Distribution", styles["section"]))
+        story.append(Paragraph("3. Road Type Distribution", styles["section"]))
         type_table = [["Road Type", "Length (km)", "Percentage"]]
         for item in td[:10]:
             type_table.append([item["label"], str(item["length_km"]), f"{item['percent']}%"])
@@ -568,8 +626,13 @@ async def generate_report_endpoint(
         story.append(t2)
         story.append(Spacer(1, 0.5*cm))
 
-        story.append(Paragraph("3. ITS Readiness Assessment", styles["section"]))
-        story.append(Paragraph(f"<b>{s['its_readiness']['label']}</b>: {s['its_readiness']['desc']}", styles["body"]))
+        story.append(Paragraph("4. ITS Readiness Assessment", styles["section"]))
+        story.append(Paragraph(f"<b>{s['its_readiness']['label']}</b> ({readiness_score}/100): {s['its_readiness']['desc']}", styles["body"]))
+        story.append(Paragraph(
+            "Score basis: road density contributes up to 45 points, connectivity contributes up to 35 points, "
+            "and intersection availability contributes up to 20 points. This score is intended for planning screening, not statutory certification.",
+            styles["body"],
+        ))
         story.append(Spacer(1, 1*cm))
 
         story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))

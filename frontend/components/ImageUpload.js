@@ -95,8 +95,8 @@ export default function ImageUpload() {
             Automated road-feature extraction from uploaded imagery
           </div>
           <div style={{ color: "var(--muted)", maxWidth: 680, lineHeight: 1.7, fontSize: 14 }}>
-            The pipeline now uses a SegFormer satellite segmentation model with a road class,
-            followed by topology extraction and ITS-oriented post-analysis.
+            The pipeline uses a fast urban-asphalt detector followed by topology extraction,
+            metric calculation, and post-analysis.
           </div>
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -137,6 +137,7 @@ export default function ImageUpload() {
                 <div><strong>Road profile:</strong> {result.analysis_summary?.road_profile}</div>
                 <div><strong>Network pattern:</strong> {result.analysis_summary?.network_pattern}</div>
                 <div><strong>Confidence:</strong> {result.analysis_summary?.extraction_confidence}</div>
+                <div><strong>Quality score:</strong> {result.analysis_summary?.quality_score}/100</div>
               </div>
             </div>
 

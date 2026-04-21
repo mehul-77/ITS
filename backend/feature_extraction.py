@@ -53,10 +53,10 @@ def extract_features(binary_mask: np.ndarray) -> tuple[np.ndarray, dict]:
     skeleton = skeletonize_mask(binary_mask)
     skel, neighbor_sum = _neighbor_counts(skeleton)
 
-    intersections_mask = np.logical_and(skel == 1, neighbor_sum >= 4)
+    intersections_mask = np.logical_and(skel == 1, neighbor_sum >= 3)
     endpoints_mask = np.logical_and(skel == 1, neighbor_sum == 1)
 
-    intersections = _extract_cluster_centers(intersections_mask, min_area=3, merge_radius=12.0)
+    intersections = _extract_cluster_centers(intersections_mask, min_area=4, merge_radius=42.0)
     endpoints = _extract_cluster_centers(endpoints_mask, min_area=2, merge_radius=8.0)
 
     feature_summary = {

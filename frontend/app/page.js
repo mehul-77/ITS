@@ -265,62 +265,24 @@ export default function Home() {
                       }}
                     />
                   </div>
-                  <div
-                    style={{
-                      position: "absolute",
-                      left: 18,
-                      bottom: 18,
-                      zIndex: 10,
-                      background: "rgba(255,255,255,0.9)",
-                      border: "1px solid rgba(15, 23, 42, 0.12)",
-                      borderRadius: 16,
-                      padding: "12px 14px",
-                      backdropFilter: "blur(10px)",
-                      color: "#0f172a",
-                      minWidth: 220,
-                    }}
-                  >
-                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", color: "#475569", marginBottom: 8 }}>
-                      Active Layer
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+                  <div style={{ padding: 14, borderRadius: 16, border: "1px solid var(--border)", background: activeLayer === "roads" ? "rgba(45,212,191,0.08)" : "rgba(255,255,255,0.03)" }}>
+                    <div style={{ color: "var(--accent2)", fontFamily: "var(--font-mono)", fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>Roads</div>
+                    <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.6 }}>Colored lines show road hierarchy. Thicker/brighter lines usually represent more important corridors.</div>
+                  </div>
+                  <div style={{ padding: 14, borderRadius: 16, border: "1px solid var(--border)", background: activeLayer === "heatmap" ? "rgba(45,212,191,0.08)" : "rgba(255,255,255,0.03)" }}>
+                    <div style={{ color: "var(--accent)", fontFamily: "var(--font-mono)", fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>Heatmap</div>
+                    <div style={{ display: "flex", gap: 5, marginBottom: 8 }}>
+                      {["#2dd4bf", "#84cc16", "#f59e0b", "#ea580c", "#b91c1c"].map((color) => (
+                        <span key={color} style={{ width: 28, height: 10, borderRadius: 999, background: color }} />
+                      ))}
                     </div>
-                    {activeLayer === "roads" ? (
-                      <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-                        Colored polylines show road hierarchy from major corridors to local streets.
-                      </div>
-                    ) : null}
-                    {activeLayer === "heatmap" ? (
-                      <div style={{ display: "grid", gap: 8 }}>
-                        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-                          Heatmap cells show relative road concentration in the selected study area.
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          {["#2dd4bf", "#84cc16", "#f59e0b", "#ea580c", "#b91c1c"].map((color) => (
-                            <span key={color} style={{ width: 22, height: 10, borderRadius: 999, background: color }} />
-                          ))}
-                        </div>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748b" }}>
-                          <span>Lower</span>
-                          <span>Higher</span>
-                        </div>
-                      </div>
-                    ) : null}
-                    {activeLayer === "intersections" ? (
-                      <div style={{ display: "grid", gap: 8 }}>
-                        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-                          Yellow markers are intersections. Red markers indicate dead ends.
-                        </div>
-                        <div style={{ display: "flex", gap: 14, fontSize: 12 }}>
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                            <span style={{ width: 12, height: 12, borderRadius: "50%", background: "#facc15", border: "2px solid #7c2d12" }} />
-                            Intersection
-                          </span>
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                            <span style={{ width: 12, height: 12, borderRadius: "50%", background: "#ef4444", border: "2px solid #7f1d1d" }} />
-                            Dead end
-                          </span>
-                        </div>
-                      </div>
-                    ) : null}
+                    <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.6 }}>Blue/green means lower road concentration. Orange/red means higher road concentration.</div>
+                  </div>
+                  <div style={{ padding: 14, borderRadius: 16, border: "1px solid var(--border)", background: activeLayer === "intersections" ? "rgba(45,212,191,0.08)" : "rgba(255,255,255,0.03)" }}>
+                    <div style={{ color: "#facc15", fontFamily: "var(--font-mono)", fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>Intersections</div>
+                    <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.6 }}>Yellow markers indicate junctions. Red markers indicate dead ends or weak connectivity points.</div>
                   </div>
                 </div>
                 </div>
